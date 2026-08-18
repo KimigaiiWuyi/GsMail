@@ -1,4 +1,4 @@
-"""gscore_mail：SMTP / Agently 后端与公开 send()。随插件仓库走，不进 gsuid-core。"""
+"""gscore_mail：邮箱池策略与公开 send()。随插件仓库走，不进 gsuid-core。"""
 
 # ruff: noqa: E402
 from __future__ import annotations
@@ -14,14 +14,17 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from gscore_mail.api import send as mail_send
+from gscore_mail.api.hosts import SMTP_HOST_PRESETS
 from gscore_mail.api.agently import send_args, parse_cli_payload
-from gscore_mail.api.settings import MailSettings
+from gscore_mail.api.settings import MailAccount, MailSettings, select_accounts
+from gscore_mail.gscore_mail_config.config_default import CONFIG_DEFAULT
 
 
-def _settings(**overrides: object) -> MailSettings:
-    base = MailSettings(
-        enable_send=True,
-        backend="smtp",
+def _account(**overrides: object) -> MailAccount:
+    base = MailAccount(
+        name="main",
+        enabled=True,
+        kind="smtp",
         smtp_host="smtp.example.com",
         smtp_port=587,
         smtp_user="from@example.com",
@@ -30,12 +33,60 @@ def _settings(**overrides: object) -> MailSettings:
         smtp_security="starttls",
         smtp_timeout=10,
         agently_cli="agently-cli",
-        agently_auto_confirm=True,
+        agently_home="",
         agently_timeout=15,
     )
     data = base.__dict__.copy()
     data.update(overrides)
-    return MailSettings(**data)
+    return MailAccount(**data)
+
+
+def _settings(**overrides: object) -> MailSettings:
+    accounts = overrides["accounts"] if "accounts" in overrides else (_account(),)
+    if not isinstance(accounts, tuple):
+        raise TypeError("accounts must be tuple[MailAccount, ...]")
+    strategy = overrides["send_strategy"] if "send_strategy" in overrides else "failover"
+    if not isinstance(strategy, str):
+        raise TypeError("send_strategy must be str")
+    enable_send = overrides["enable_send"] if "enable_send" in overrides else True
+    if not isinstance(enable_send, bool):
+        raise TypeError("enable_send must be bool")
+    auto_confirm = overrides["agently_auto_confirm"] if "agently_auto_confirm" in overrides else True
+    if not isinstance(auto_confirm, bool):
+        raise TypeError("agently_auto_confirm must be bool")
+    return MailSettings(
+        enable_send=enable_send,
+        send_strategy=strategy,
+        agently_auto_confirm=auto_confirm,
+        accounts=accounts,
+    )
+
+
+def test_smtp_host_presets_cover_common_providers() -> None:
+    assert "smtp.gmail.com" in SMTP_HOST_PRESETS
+    assert "smtp.qq.com" in SMTP_HOST_PRESETS
+    assert "smtp.163.com" in SMTP_HOST_PRESETS
+    pool = CONFIG_DEFAULT["mail_accounts"]
+    from gsuid_core.utils.plugins_config.models import GsStrConfig, GsRepeatGroupConfig
+
+    assert isinstance(pool, GsRepeatGroupConfig)
+    host = pool.template["smtp_host"]
+    assert isinstance(host, GsStrConfig)
+    assert host.options == SMTP_HOST_PRESETS
+
+
+def test_select_accounts_never_failover_random() -> None:
+    first = _account(name="a")
+    second = _account(name="b", kind="agently")
+    off = _account(name="off", enabled=False)
+    pool = [first, off, second]
+    never = select_accounts(pool, "never")
+    assert never == [first]
+    fail = select_accounts(pool, "failover")
+    assert fail == [first, second]
+    picked = select_accounts(pool, "random")
+    assert len(picked) == 1
+    assert picked[0] in (first, second)
 
 
 def test_agently_send_args_confirmed_and_token() -> None:
@@ -88,6 +139,7 @@ def test_send_smtp_success(monkeypatch: pytest.MonkeyPatch) -> None:
         result = await mail_send(to="to@ex.com", subject="S", body="B", cc="c@ex.com")
         assert result["ok"] is True
         assert result["backend"] == "smtp"
+        assert result["account"] == "main"
         assert called
 
     asyncio.run(_run())
@@ -98,18 +150,82 @@ def test_send_agently_uses_cli(monkeypatch: pytest.MonkeyPatch) -> None:
 
     captured: list[list[str]] = []
 
-    async def fake_run(cli: str, args: list[str], timeout: int) -> dict[str, object]:
+    async def fake_run(cli: str, args: list[str], timeout: int, home: str = "") -> dict[str, object]:
         captured.append(args)
         return {"exit_code": 0, "stdout": '{"id":"msg_1"}', "stderr": ""}
 
     async def _run() -> None:
-        monkeypatch.setattr(api_mod, "load_settings", lambda: _settings(backend="agently"))
+        settings = _settings(accounts=(_account(name="ag1", kind="agently"),))
+        monkeypatch.setattr(api_mod, "load_settings", lambda: settings)
         monkeypatch.setattr(api_mod.agently_backend, "run_agently", fake_run)
         result = await mail_send(to="to@ex.com", subject="S", body="B")
         assert result["ok"] is True
         assert result["backend"] == "agently"
         assert captured
         assert "--confirmed" in captured[0]
+
+    asyncio.run(_run())
+
+
+def test_failover_smtp_then_agently(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api as api_mod
+
+    async def boom(*_args: object) -> None:
+        raise OSError("smtp down")
+
+    captured: list[str] = []
+
+    async def fake_run(cli: str, args: list[str], timeout: int, home: str = "") -> dict[str, object]:
+        captured.append(cli)
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+    async def _run() -> None:
+        settings = _settings(
+            send_strategy="failover",
+            accounts=(
+                _account(name="qq", kind="smtp"),
+                _account(name="agent", kind="agently", agently_cli="agently-cli"),
+            ),
+        )
+        monkeypatch.setattr(api_mod, "load_settings", lambda: settings)
+        monkeypatch.setattr(api_mod, "send_smtp", boom)
+        monkeypatch.setattr(api_mod.agently_backend, "run_agently", fake_run)
+        result = await mail_send(to="to@ex.com", subject="S", body="B")
+        assert result["ok"] is True
+        assert result["backend"] == "agently"
+        assert result["account"] == "agent"
+        assert captured
+
+    asyncio.run(_run())
+
+
+def test_never_does_not_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api as api_mod
+
+    async def boom(*_args: object) -> None:
+        raise OSError("smtp down")
+
+    called = {"agently": 0}
+
+    async def fake_run(cli: str, args: list[str], timeout: int, home: str = "") -> dict[str, object]:
+        called["agently"] += 1
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+    async def _run() -> None:
+        settings = _settings(
+            send_strategy="never",
+            accounts=(
+                _account(name="qq", kind="smtp"),
+                _account(name="agent", kind="agently"),
+            ),
+        )
+        monkeypatch.setattr(api_mod, "load_settings", lambda: settings)
+        monkeypatch.setattr(api_mod, "send_smtp", boom)
+        monkeypatch.setattr(api_mod.agently_backend, "run_agently", fake_run)
+        result = await mail_send(to="to@ex.com", subject="S", body="B")
+        assert result["ok"] is False
+        assert result["account"] == "qq"
+        assert called["agently"] == 0
 
     asyncio.run(_run())
 
@@ -127,7 +243,7 @@ def test_smtp_send_uses_starttls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "aiosmtplib", SimpleNamespace(send=fake_send))
 
     async def _run() -> None:
-        await send_smtp(_settings(), ["to@ex.com"], "S", "B", [], [], False)
+        await send_smtp(_account(), ["to@ex.com"], "S", "B", [], [], False)
 
     asyncio.run(_run())
     assert captured

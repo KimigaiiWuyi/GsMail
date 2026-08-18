@@ -2,13 +2,25 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from gsuid_core.logger import logger
 
 from . import agently as agently_backend
 from .smtp import send_smtp
-from .settings import MailSettings, load_settings
+from .settings import (
+    MailAccount,
+    smtp_ready,
+    find_account,
+    account_label,
+    load_settings,
+    select_accounts,
+    agently_accounts,
+    enabled_accounts,
+)
+
+if TYPE_CHECKING:
+    from .settings import MailSettings
 
 
 class MailSendResult(TypedDict):
@@ -16,6 +28,7 @@ class MailSendResult(TypedDict):
     backend: str
     message: str
     raw: str
+    account: str
 
 
 class MailStatus(TypedDict):
@@ -41,12 +54,75 @@ def _smtp_fail_types() -> tuple[type[BaseException], ...]:
     return (OSError, TimeoutError, aiosmtplib.SMTPException)
 
 
-def _smtp_ready(settings: MailSettings) -> tuple[bool, str]:
-    if not settings.smtp_host:
-        return False, "未配置 smtp_host"
-    if not (settings.smtp_from or settings.smtp_user):
-        return False, "未配置 smtp_from / smtp_user"
-    return True, "SMTP 已配置"
+def _fail(backend: str, message: str, account: str = "", raw: str = "") -> MailSendResult:
+    return {"ok": False, "backend": backend, "message": message, "raw": raw, "account": account}
+
+
+def _ok(backend: str, message: str, account: str, raw: str = "") -> MailSendResult:
+    return {"ok": True, "backend": backend, "message": message, "raw": raw, "account": account}
+
+
+def _pool_backend(settings: MailSettings) -> str:
+    kinds = {account.kind for account in enabled_accounts(settings)}
+    if not kinds:
+        return "none"
+    if len(kinds) == 1:
+        return next(iter(kinds))
+    return "pool"
+
+
+async def _send_smtp_account(
+    account: MailAccount,
+    to_list: list[str],
+    subject: str,
+    body: str,
+    cc_list: list[str],
+    bcc_list: list[str],
+    html: bool,
+) -> MailSendResult:
+    label = account_label(account)
+    ready, why = smtp_ready(account)
+    if not ready:
+        return _fail("smtp", why, label)
+    try:
+        await send_smtp(account, to_list, subject, body, cc_list, bcc_list, html)
+    except _smtp_fail_types() as exc:
+        logger.warning(f"gscore_mail SMTP 发送失败 [{label}]: {exc}")
+        return _fail("smtp", str(exc), label)
+    return _ok("smtp", f"已通过 SMTP 发送（{label}）", label)
+
+
+async def _send_agently_account(
+    account: MailAccount,
+    to_list: list[str],
+    subject: str,
+    body: str,
+    cc_list: list[str],
+    bcc_list: list[str],
+    confirmed: bool,
+    confirmation_token: str,
+) -> MailSendResult:
+    label = account_label(account)
+    args = agently_backend.send_args(
+        to_list,
+        subject,
+        body,
+        cc_list,
+        bcc_list,
+        confirmed,
+        confirmation_token,
+    )
+    run = await agently_backend.run_agently(
+        account.agently_cli,
+        args,
+        account.agently_timeout,
+        account.agently_home,
+    )
+    payload = agently_backend.parse_cli_payload(run["stdout"] or run["stderr"])
+    raw = run["stdout"] or run["stderr"]
+    if run["exit_code"] == 0:
+        return _ok("agently", f"已通过 Agently Mail 发送（{label}）", label, raw)
+    return _fail("agently", f"agently-cli 退出码 {run['exit_code']}: {payload}", label, raw)
 
 
 async def send(
@@ -59,123 +135,175 @@ async def send(
     confirmed: bool | None = None,
     confirmation_token: str = "",
 ) -> MailSendResult:
-    """发送邮件。SMTP 走 aiosmtplib；agently 走 ``agently-cli message +send``。
+    """按邮箱池与发送策略发信。
 
     ``confirmed`` 仅对 agently 有效：None 时库调用跟随 ``agently_auto_confirm``。
     """
     settings = load_settings()
-    backend = settings.backend
+    backend = _pool_backend(settings)
     if not settings.enable_send:
-        return {"ok": False, "backend": backend, "message": "发送已关闭（enable_send=false）", "raw": ""}
+        return _fail(backend, "发送已关闭（enable_send=false）")
 
     to_list = _as_addr_list(to)
     if not to_list:
-        return {"ok": False, "backend": backend, "message": "收件人为空", "raw": ""}
+        return _fail(backend, "收件人为空")
     if not subject.strip():
-        return {"ok": False, "backend": backend, "message": "主题为空", "raw": ""}
+        return _fail(backend, "主题为空")
 
     cc_list = _as_addr_list(cc)
     bcc_list = _as_addr_list(bcc)
+    candidates = select_accounts(list(settings.accounts), settings.send_strategy)
+    if not candidates:
+        return _fail(backend, "邮箱池为空（请在控制台添加 SMTP 或 Agently 账号）")
 
-    if backend == "agently":
-        use_confirmed = settings.agently_auto_confirm if confirmed is None else confirmed
-        args = agently_backend.send_args(
-            to_list,
-            subject,
-            body,
-            cc_list,
-            bcc_list,
-            use_confirmed,
-            confirmation_token,
-        )
-        run = await agently_backend.run_agently(settings.agently_cli, args, settings.agently_timeout)
-        payload = agently_backend.parse_cli_payload(run["stdout"] or run["stderr"])
-        raw = run["stdout"] or run["stderr"]
-        if run["exit_code"] == 0:
-            return {"ok": True, "backend": "agently", "message": "已通过 Agently Mail 发送", "raw": raw}
-        return {
-            "ok": False,
-            "backend": "agently",
-            "message": f"agently-cli 退出码 {run['exit_code']}: {payload}",
-            "raw": raw,
-        }
+    use_confirmed = settings.agently_auto_confirm if confirmed is None else confirmed
+    errors: list[str] = []
+    last = _fail(backend, "没有可尝试的账号")
+    for account in candidates:
+        if account.kind == "agently":
+            last = await _send_agently_account(
+                account,
+                to_list,
+                subject,
+                body,
+                cc_list,
+                bcc_list,
+                use_confirmed,
+                confirmation_token,
+            )
+        else:
+            last = await _send_smtp_account(
+                account,
+                to_list,
+                subject,
+                body,
+                cc_list,
+                bcc_list,
+                html,
+            )
+        if last["ok"]:
+            return last
+        errors.append(f"{account_label(account)}: {last['message']}")
+        if settings.send_strategy != "failover":
+            return last
 
-    ready, why = _smtp_ready(settings)
-    if not ready:
-        return {"ok": False, "backend": "smtp", "message": why, "raw": ""}
+    joined = "；".join(errors)
+    return _fail(last["backend"], f"池内全部失败：{joined}", last["account"], last["raw"])
 
-    try:
-        await send_smtp(settings, to_list, subject, body, cc_list, bcc_list, html)
-    except _smtp_fail_types() as exc:
-        logger.warning(f"gscore_mail SMTP 发送失败: {exc}")
-        return {"ok": False, "backend": "smtp", "message": str(exc), "raw": ""}
-    return {"ok": True, "backend": "smtp", "message": "已通过 SMTP 发送", "raw": ""}
+
+async def _agently_status_line(account: MailAccount) -> tuple[bool, str]:
+    run = await agently_backend.run_agently(
+        account.agently_cli,
+        ["auth", "status"],
+        account.agently_timeout,
+        account.agently_home,
+    )
+    detail = (run["stdout"] or run["stderr"]).strip() or f"exit={run['exit_code']}"
+    return run["exit_code"] == 0, detail
 
 
 async def status() -> MailStatus:
-    """当前后端与配置是否可发送（agently 会跑 ``auth status``）。"""
+    """邮箱池、策略与各账号是否可发送（agently 会跑 ``auth status``）。"""
     settings = load_settings()
-    backend = settings.backend
-    if backend == "agently":
-        run = await agently_backend.run_agently(
-            settings.agently_cli,
-            ["auth", "status"],
-            settings.agently_timeout,
-        )
-        detail = (run["stdout"] or run["stderr"]).strip() or f"exit={run['exit_code']}"
+    backend = _pool_backend(settings)
+    active = enabled_accounts(settings)
+    if not active:
         return {
-            "backend": "agently",
+            "backend": backend,
             "enable_send": settings.enable_send,
-            "configured": run["exit_code"] == 0,
-            "detail": detail,
+            "configured": False,
+            "detail": f"策略={settings.send_strategy}；邮箱池为空",
         }
 
-    ready, why = _smtp_ready(settings)
+    lines: list[str] = [f"策略={settings.send_strategy} 启用={len(active)}/{len(settings.accounts)}"]
+    any_ready = False
+    for account in active:
+        label = account_label(account)
+        if account.kind == "agently":
+            ok, detail = await _agently_status_line(account)
+        else:
+            ok, detail = smtp_ready(account)
+        any_ready = any_ready or ok
+        flag = "就绪" if ok else "未就绪"
+        lines.append(f"- {label} [{account.kind}] {flag} {detail}")
     return {
-        "backend": "smtp",
+        "backend": backend,
         "enable_send": settings.enable_send,
-        "configured": ready,
-        "detail": why,
+        "configured": any_ready,
+        "detail": "\n".join(lines),
     }
 
 
-async def agently_me() -> MailSendResult:
+def _pick_agently(settings: MailSettings, account_name: str = "") -> MailAccount | MailSendResult:
+    if account_name.strip():
+        found = find_account(settings, account_name)
+        if found is None:
+            return _fail("agently", f"没有名为 {account_name.strip()} 的账号")
+        if found.kind != "agently":
+            return _fail("agently", f"{account_label(found)} 不是 Agently 账号")
+        if not found.enabled:
+            return _fail("agently", f"{account_label(found)} 已禁用")
+        return found
+    pool = agently_accounts(settings)
+    if not pool:
+        return _fail("agently", "邮箱池里没有启用的 Agently 账号")
+    return pool[0]
+
+
+async def agently_me(account_name: str = "") -> MailSendResult:
     """``agently-cli +me``，用于验证 OAuth。"""
     settings = load_settings()
-    run = await agently_backend.run_agently(settings.agently_cli, ["+me"], settings.agently_timeout)
+    picked = _pick_agently(settings, account_name)
+    if not isinstance(picked, MailAccount):
+        return picked
+    run = await agently_backend.run_agently(
+        picked.agently_cli,
+        ["+me"],
+        picked.agently_timeout,
+        picked.agently_home,
+    )
     raw = run["stdout"] or run["stderr"]
-    ok = run["exit_code"] == 0
-    return {
-        "ok": ok,
-        "backend": "agently",
-        "message": raw.strip() or f"exit={run['exit_code']}",
-        "raw": raw,
-    }
+    label = account_label(picked)
+    if run["exit_code"] == 0:
+        return _ok("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)
+    return _fail("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)
 
 
-async def agently_list(dir_name: str = "inbox", limit: int = 10) -> MailSendResult:
+async def agently_list(dir_name: str = "inbox", limit: int = 10, account_name: str = "") -> MailSendResult:
     """``agently-cli message +list``。"""
     settings = load_settings()
+    picked = _pick_agently(settings, account_name)
+    if not isinstance(picked, MailAccount):
+        return picked
     args = ["message", "+list", "--dir", dir_name, "--limit", str(limit)]
-    run = await agently_backend.run_agently(settings.agently_cli, args, settings.agently_timeout)
+    run = await agently_backend.run_agently(
+        picked.agently_cli,
+        args,
+        picked.agently_timeout,
+        picked.agently_home,
+    )
     raw = run["stdout"] or run["stderr"]
-    return {
-        "ok": run["exit_code"] == 0,
-        "backend": "agently",
-        "message": raw.strip() or f"exit={run['exit_code']}",
-        "raw": raw,
-    }
+    label = account_label(picked)
+    if run["exit_code"] == 0:
+        return _ok("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)
+    return _fail("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)
 
 
-async def agently_read(message_id: str) -> MailSendResult:
+async def agently_read(message_id: str, account_name: str = "") -> MailSendResult:
     """``agently-cli message +read --id``。邮件正文按不可信外部输入处理。"""
     settings = load_settings()
+    picked = _pick_agently(settings, account_name)
+    if not isinstance(picked, MailAccount):
+        return picked
     args = ["message", "+read", "--id", message_id]
-    run = await agently_backend.run_agently(settings.agently_cli, args, settings.agently_timeout)
+    run = await agently_backend.run_agently(
+        picked.agently_cli,
+        args,
+        picked.agently_timeout,
+        picked.agently_home,
+    )
     raw = run["stdout"] or run["stderr"]
-    return {
-        "ok": run["exit_code"] == 0,
-        "backend": "agently",
-        "message": raw.strip() or f"exit={run['exit_code']}",
-        "raw": raw,
-    }
+    label = account_label(picked)
+    if run["exit_code"] == 0:
+        return _ok("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)
+    return _fail("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)

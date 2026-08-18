@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import json
 import shutil
 import asyncio
@@ -26,14 +27,27 @@ def resolve_cli(configured: str) -> str:
     return raw
 
 
-async def run_agently(cli: str, args: list[str], timeout: int) -> AgentlyRunResult:
+def _cli_env(home: str) -> dict[str, str] | None:
+    raw = home.strip()
+    if not raw:
+        return None
+    env = dict(os.environ)
+    env["HOME"] = raw
+    env["USERPROFILE"] = raw
+    env["XDG_CONFIG_HOME"] = str(Path(raw) / ".config")
+    return env
+
+
+async def run_agently(cli: str, args: list[str], timeout: int, home: str = "") -> AgentlyRunResult:
     exe = resolve_cli(cli)
+    env = _cli_env(home)
     try:
         proc = await asyncio.create_subprocess_exec(
             exe,
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
     except FileNotFoundError:
         return {

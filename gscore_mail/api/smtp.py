@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 
-from .settings import MailSettings
+from .settings import MailAccount
 
 
 def _build_message(
-    settings: MailSettings,
+    account: MailAccount,
     to: list[str],
     subject: str,
     body: str,
     cc: list[str],
     html: bool,
 ) -> EmailMessage:
-    from_addr = settings.smtp_from or settings.smtp_user
+    from_addr = account.smtp_from or account.smtp_user
     msg = EmailMessage()
     msg["From"] = from_addr
     msg["To"] = ", ".join(to)
@@ -30,7 +30,7 @@ def _build_message(
 
 
 async def send_smtp(
-    settings: MailSettings,
+    account: MailAccount,
     to: list[str],
     subject: str,
     body: str,
@@ -43,20 +43,20 @@ async def send_smtp(
     except ImportError as exc:
         raise OSError("缺少依赖 aiosmtplib，请重启 Core 让插件按 pyproject.toml 自动安装") from exc
 
-    msg = _build_message(settings, to, subject, body, cc, html)
+    msg = _build_message(account, to, subject, body, cc, html)
     recipients = to + cc + bcc
-    use_tls = settings.smtp_security == "ssl"
-    start_tls = settings.smtp_security == "starttls"
-    username = settings.smtp_user or None
-    password = settings.smtp_password if username else None
+    use_tls = account.smtp_security == "ssl"
+    start_tls = account.smtp_security == "starttls"
+    username = account.smtp_user or None
+    password = account.smtp_password if username else None
     await aiosmtplib.send(
         msg,
-        hostname=settings.smtp_host,
-        port=settings.smtp_port,
+        hostname=account.smtp_host,
+        port=account.smtp_port,
         username=username,
         password=password,
         recipients=recipients,
-        timeout=settings.smtp_timeout,
+        timeout=account.smtp_timeout,
         use_tls=use_tls,
         start_tls=start_tls,
     )

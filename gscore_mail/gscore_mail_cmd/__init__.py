@@ -29,4 +29,5 @@ async def cmd_mail_test(bot: Bot, ev: Event) -> None:
         body="这是一封来自 GsCore gscore_mail 的测试邮件。",
     )
     prefix = "成功" if result["ok"] else "失败"
-    await bot.send(f"[gscore_mail] {prefix}（{result['backend']}）：{result['message']}")
+    label = result["account"] or result["backend"]
+    await bot.send(f"[gscore_mail] {prefix}（{label}）：{result['message']}")
