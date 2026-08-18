@@ -1,0 +1,33 @@
+{
+  "python.languageServer": "None",
+  "editor.formatOnSave": true,
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": "explicit",
+      "source.fixAll.ruff": "explicit"
+    }
+  },
+  "[toml]": {
+    "editor.defaultFormatter": null,
+    "editor.formatOnSave": false
+  },
+  "ruff.exclude": ["**/pyproject.toml", "**/*.toml"],
+  "files.associations": {
+    "pyproject.toml": "toml"
+  },
+  "python.autoComplete.extraPaths": [
+    "${workspaceFolder}/../../../"
+  ],
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/../../../"
+  ],
+  "python.analysis.typeCheckingMode": "off",
+  "basedpyright.analysis.typeCheckingMode": "basic",
+  "basedpyright.analysis.extraPaths": [
+    "${workspaceFolder}/../../../",
+    "${workspaceFolder}/../../../gsuid_core"
+  ],
+  "python.defaultInterpreterPath": "${workspaceFolder}/../../../.venv/Scripts/python.exe"
+}

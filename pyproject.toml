@@ -1,0 +1,18 @@
+[project]
+name = "gscore-mail"
+version = "0.1.0"
+description = "GsCore 基础设施插件：SMTP + 腾讯 Agently Mail（agent.qq.com）"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "aiosmtplib>=3.0.0",
+]
+
+# 启动时由 Core 读取 [project].dependencies 合并 pip 安装。
+# python / fastapi / pydantic / gsuid-core / sqlmodel / apscheduler /
+# pydantic-ai 等框架基础依赖无需重复声明。
+# Agently Mail 走本机 agently-cli（npm），不是 PyPI 包。
+
+[tool.gsuid]
+kind = "meta"
+provides = "mail"

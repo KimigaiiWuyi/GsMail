@@ -1,0 +1,12 @@
+{
+  "include": ["gscore_mail", "tests"],
+  "exclude": ["**/__pycache__", "**/node_modules"],
+  "extraPaths": [
+    "../../../",
+    "../../../gsuid_core"
+  ],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": false,
+  "reportMissingModuleSource": false
+}
