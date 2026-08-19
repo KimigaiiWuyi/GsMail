@@ -15,8 +15,15 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 from gscore_mail.api import send as mail_send
 from gscore_mail.api.hosts import SMTP_HOST_PRESETS
-from gscore_mail.api.agently import send_args, parse_cli_payload
-from gscore_mail.api.settings import MailAccount, MailSettings, select_accounts
+from gscore_mail.api.agently import send_args, spawn_argv, resolve_cli, parse_cli_payload
+from gscore_mail.api.settings import (
+    MailAccount,
+    MailSettings,
+    smtp_from_row,
+    merge_accounts,
+    select_accounts,
+    agently_from_row,
+)
 from gscore_mail.gscore_mail_config.config_default import CONFIG_DEFAULT
 
 
@@ -66,13 +73,163 @@ def test_smtp_host_presets_cover_common_providers() -> None:
     assert "smtp.gmail.com" in SMTP_HOST_PRESETS
     assert "smtp.qq.com" in SMTP_HOST_PRESETS
     assert "smtp.163.com" in SMTP_HOST_PRESETS
-    pool = CONFIG_DEFAULT["mail_accounts"]
+    pool = CONFIG_DEFAULT["smtp_accounts"]
     from gsuid_core.utils.plugins_config.models import GsStrConfig, GsRepeatGroupConfig
 
     assert isinstance(pool, GsRepeatGroupConfig)
     host = pool.template["smtp_host"]
     assert isinstance(host, GsStrConfig)
     assert host.options == SMTP_HOST_PRESETS
+
+
+def test_config_splits_smtp_and_agently_groups() -> None:
+    from gsuid_core.utils.plugins_config.models import GsRepeatGroupConfig
+
+    assert "mail_accounts" not in CONFIG_DEFAULT
+    smtp = CONFIG_DEFAULT["smtp_accounts"]
+    agently = CONFIG_DEFAULT["agently_accounts"]
+    assert isinstance(smtp, GsRepeatGroupConfig)
+    assert isinstance(agently, GsRepeatGroupConfig)
+    assert "smtp_host" in smtp.template
+    assert "agently_cli" not in smtp.template
+    assert "kind" not in smtp.template
+    assert "agently_cli" in agently.template
+    assert "smtp_host" not in agently.template
+    assert "kind" not in agently.template
+
+
+def test_row_parsers_and_merge_order() -> None:
+    from gsuid_core.utils.plugins_config.models import GsIntConfig, GsStrConfig, GsBoolConfig
+
+    smtp = smtp_from_row(
+        {
+            "name": GsStrConfig("", "", "qq"),
+            "enabled": GsBoolConfig("", "", True),
+            "smtp_host": GsStrConfig("", "", "smtp.qq.com"),
+            "smtp_user": GsStrConfig("", "", "a@qq.com"),
+            "smtp_password": GsStrConfig("", "", "auth"),
+        },
+        "smtp-1",
+    )
+    agently = agently_from_row(
+        {
+            "name": GsStrConfig("", "", "agent"),
+            "enabled": GsBoolConfig("", "", True),
+            "agently_cli": GsStrConfig("", "", "agently-cli"),
+            "agently_timeout": GsIntConfig("", "", 45),
+        },
+        "agently-1",
+    )
+    assert smtp.kind == "smtp"
+    assert smtp.smtp_host == "smtp.qq.com"
+    assert agently.kind == "agently"
+    assert agently.agently_timeout == 45
+    pool = merge_accounts([smtp], [agently])
+    assert [item.kind for item in pool] == ["smtp", "agently"]
+
+
+def test_load_pool_prefers_split_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api.settings as settings_mod
+    import gscore_mail.gscore_mail_config as cfg_mod
+    from gsuid_core.utils.plugins_config.models import GsStrConfig, GsBoolConfig, GsRepeatGroupConfig
+
+    smtp_group = GsRepeatGroupConfig(
+        title="",
+        desc="",
+        data=[
+            {
+                "name": GsStrConfig("", "", "qq"),
+                "enabled": GsBoolConfig("", "", True),
+                "smtp_host": GsStrConfig("", "", "smtp.qq.com"),
+                "smtp_user": GsStrConfig("", "", "a@qq.com"),
+            }
+        ],
+        template={},
+    )
+    agently_group = GsRepeatGroupConfig(
+        title="",
+        desc="",
+        data=[
+            {
+                "name": GsStrConfig("", "", "agent"),
+                "enabled": GsBoolConfig("", "", True),
+                "agently_cli": GsStrConfig("", "", "agently-cli"),
+            }
+        ],
+        template={},
+    )
+    old_group = GsRepeatGroupConfig(
+        title="",
+        desc="",
+        data=[{"name": GsStrConfig("", "", "legacy-mixed"), "kind": GsStrConfig("", "", "smtp")}],
+        template={},
+    )
+    written: list[tuple[str, object]] = []
+
+    class _Fake:
+        def get_config(self, key: str, default_value: object = None) -> object:
+            if key == "smtp_accounts":
+                return smtp_group
+            if key == "agently_accounts":
+                return agently_group
+            if key == "mail_accounts":
+                return old_group
+            return GsBoolConfig("", "", False)
+
+        def set_config(self, key: str, value: object) -> bool:
+            written.append((key, value))
+            return True
+
+    monkeypatch.setattr(cfg_mod, "mail_config", _Fake())
+    pool = settings_mod._load_pool()
+    assert [item.name for item in pool] == ["qq", "agent"]
+    assert written == []
+
+
+def test_load_pool_migrates_unified_orphan(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api.settings as settings_mod
+    import gscore_mail.gscore_mail_config as cfg_mod
+    from gsuid_core.utils.plugins_config.models import GsStrConfig, GsBoolConfig, GsRepeatGroupConfig
+
+    empty = GsRepeatGroupConfig(title="", desc="", data=[], template={})
+    old_group = GsRepeatGroupConfig(
+        title="",
+        desc="",
+        data=[
+            {
+                "name": GsStrConfig("", "", "old-smtp"),
+                "enabled": GsBoolConfig("", "", True),
+                "kind": GsStrConfig("", "", "smtp"),
+                "smtp_host": GsStrConfig("", "", "smtp.163.com"),
+            },
+            {
+                "name": GsStrConfig("", "", "old-agent"),
+                "enabled": GsBoolConfig("", "", True),
+                "kind": GsStrConfig("", "", "agently"),
+                "agently_cli": GsStrConfig("", "", "agently-cli"),
+            },
+        ],
+        template={},
+    )
+    written: list[str] = []
+
+    class _Fake:
+        def get_config(self, key: str, default_value: object = None) -> object:
+            if key in {"smtp_accounts", "agently_accounts"}:
+                return empty
+            if key == "mail_accounts":
+                return old_group
+            return GsBoolConfig("", "", False)
+
+        def set_config(self, key: str, value: object) -> bool:
+            written.append(key)
+            return True
+
+    monkeypatch.setattr(cfg_mod, "mail_config", _Fake())
+    pool = settings_mod._load_pool()
+    assert [item.name for item in pool] == ["old-smtp", "old-agent"]
+    assert [item.kind for item in pool] == ["smtp", "agently"]
+    assert written == ["smtp_accounts", "agently_accounts"]
 
 
 def test_select_accounts_never_failover_random() -> None:
@@ -252,3 +409,61 @@ def test_smtp_send_uses_starttls(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured[0]["start_tls"] is True
     assert captured[0]["use_tls"] is False
     assert captured[0]["username"] == "from@example.com"
+
+
+def _write_npm_shim(root: Path) -> tuple[Path, Path, Path]:
+    js = root / "node_modules" / "@tencent-qqmail" / "agently-cli" / "bin" / "cli.js"
+    js.parent.mkdir(parents=True)
+    js.write_text("console.log('ok')\n", encoding="utf-8")
+    pkg = root / "node_modules" / "@tencent-qqmail" / "agently-cli" / "package.json"
+    pkg.write_text('{"bin":{"agently-cli":"bin/cli.js"}}\n', encoding="utf-8")
+    shim = root / "agently-cli"
+    shim.write_text(
+        '#!/bin/sh\nexec node "$basedir/node_modules/@tencent-qqmail/agently-cli/bin/cli.js" "$@"\n',
+        encoding="utf-8",
+    )
+    cmd = root / "agently-cli.cmd"
+    cmd.write_text(
+        '@ECHO off\n"%_prog%"  "%dp0%\\node_modules\\@tencent-qqmail\\agently-cli\\bin\\cli.js" %*\n',
+        encoding="utf-8",
+    )
+    return shim, cmd, js
+
+
+def test_resolve_cli_prefers_windows_cmd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api.agently as agently_mod
+
+    shim, cmd, _js = _write_npm_shim(tmp_path)
+    monkeypatch.setattr(agently_mod.os, "name", "nt")
+    assert Path(resolve_cli(str(shim))) == cmd
+
+
+def test_spawn_argv_uses_node_entry_on_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api.agently as agently_mod
+
+    _shim, cmd, js = _write_npm_shim(tmp_path)
+    monkeypatch.setattr(agently_mod.os, "name", "nt")
+    monkeypatch.setattr(agently_mod.shutil, "which", lambda name: r"C:\Node\node.exe" if name == "node.exe" else None)
+    argv = spawn_argv(str(cmd), ["+me"])
+    assert argv[0] == r"C:\Node\node.exe"
+    assert Path(argv[1]) == js
+    assert argv[2:] == ["+me"]
+
+
+def test_run_agently_oserror_is_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api.agently as agently_mod
+
+    async def boom(*_args: object, **_kwargs: object) -> object:
+        raise OSError(193, "%1 is not a valid Win32 application")
+
+    monkeypatch.setattr(agently_mod, "resolve_cli", lambda _cli: r"C:\npm\agently-cli.cmd")
+    monkeypatch.setattr(agently_mod, "spawn_argv", lambda exe, args: [r"C:\Node\node.exe", *args])
+    monkeypatch.setattr(agently_mod, "_windows_needs_pe", lambda _argv0: False)
+    monkeypatch.setattr(agently_mod, "_spawn", boom)
+
+    async def _run() -> None:
+        result = await agently_mod.run_agently("agently-cli", ["+me"], 5)
+        assert result["exit_code"] == 127
+        assert "无法启动" in result["stderr"]
+
+    asyncio.run(_run())

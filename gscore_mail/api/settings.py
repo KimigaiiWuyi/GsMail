@@ -111,15 +111,11 @@ def account_ready(account: MailAccount) -> tuple[bool, str]:
     return smtp_ready(account)
 
 
-def _account_from_row(row: dict[str, GSC], fallback_name: str) -> MailAccount:
-    kind = _field_str(row, "kind") or "smtp"
-    if kind not in ("smtp", "agently"):
-        kind = "smtp"
-    name = _field_str(row, "name") or fallback_name
+def smtp_from_row(row: dict[str, GSC], fallback_name: str) -> MailAccount:
     return MailAccount(
-        name=name,
+        name=_field_str(row, "name") or fallback_name,
         enabled=_field_bool(row, "enabled", True),
-        kind=kind,
+        kind="smtp",
         smtp_host=_field_str(row, "smtp_host"),
         smtp_port=_field_int(row, "smtp_port", 587),
         smtp_user=_field_str(row, "smtp_user"),
@@ -127,14 +123,68 @@ def _account_from_row(row: dict[str, GSC], fallback_name: str) -> MailAccount:
         smtp_from=_field_str(row, "smtp_from"),
         smtp_security=_field_str(row, "smtp_security") or "starttls",
         smtp_timeout=_field_int(row, "smtp_timeout", 30),
+        agently_cli="agently-cli",
+        agently_home="",
+        agently_timeout=60,
+    )
+
+
+def agently_from_row(row: dict[str, GSC], fallback_name: str) -> MailAccount:
+    return MailAccount(
+        name=_field_str(row, "name") or fallback_name,
+        enabled=_field_bool(row, "enabled", True),
+        kind="agently",
+        smtp_host="",
+        smtp_port=587,
+        smtp_user="",
+        smtp_password="",
+        smtp_from="",
+        smtp_security="starttls",
+        smtp_timeout=30,
         agently_cli=_field_str(row, "agently_cli") or "agently-cli",
         agently_home=_field_str(row, "agently_home"),
         agently_timeout=_field_int(row, "agently_timeout", 60),
     )
 
 
+def merge_accounts(smtp: list[MailAccount], agently: list[MailAccount]) -> tuple[MailAccount, ...]:
+    """运行时池：SMTP 列表在前，Agently 列表在后。"""
+    return tuple([*smtp, *agently])
+
+
+def _unified_from_row(row: dict[str, GSC], fallback_name: str) -> MailAccount:
+    kind = _field_str(row, "kind") or "smtp"
+    if kind == "agently":
+        return agently_from_row(row, fallback_name)
+    return smtp_from_row(row, fallback_name)
+
+
+def _smtp_raw(account: MailAccount) -> dict[str, object]:
+    return {
+        "name": account.name,
+        "enabled": account.enabled,
+        "smtp_host": account.smtp_host,
+        "smtp_port": account.smtp_port,
+        "smtp_user": account.smtp_user,
+        "smtp_password": account.smtp_password,
+        "smtp_from": account.smtp_from,
+        "smtp_security": account.smtp_security,
+        "smtp_timeout": account.smtp_timeout,
+    }
+
+
+def _agently_raw(account: MailAccount) -> dict[str, object]:
+    return {
+        "name": account.name,
+        "enabled": account.enabled,
+        "agently_cli": account.agently_cli,
+        "agently_home": account.agently_home,
+        "agently_timeout": account.agently_timeout,
+    }
+
+
 def _legacy_account() -> MailAccount | None:
-    """池为空时读旧版单账号字段（调和后仍留在 config 里的孤儿键）。"""
+    """两组与旧 mail_accounts 都空时，读更早的孤儿单账号键。"""
     backend = _str("backend") or "smtp"
     if backend not in ("smtp", "agently"):
         backend = "smtp"
@@ -173,16 +223,40 @@ def _int_legacy(key: str, default: int) -> int:
     return default
 
 
-def _load_pool() -> tuple[MailAccount, ...]:
+def _group_rows(key: str) -> list[dict[str, GSC]]:
     from ..gscore_mail_config import mail_config
 
-    item = mail_config.get_config("mail_accounts")
+    item = mail_config.get_config(key)
     if not isinstance(item, GsRepeatGroupConfig):
-        return ()
-    accounts: list[MailAccount] = []
-    for index, row in enumerate(item.data, start=1):
-        accounts.append(_account_from_row(row, f"account-{index}"))
-    return tuple(accounts)
+        return []
+    return list(item.data)
+
+
+def _persist_split(accounts: tuple[MailAccount, ...]) -> None:
+    from ..gscore_mail_config import mail_config
+
+    smtp_raw = [_smtp_raw(account) for account in accounts if account.kind != "agently"]
+    agently_raw = [_agently_raw(account) for account in accounts if account.kind == "agently"]
+    mail_config.set_config("smtp_accounts", smtp_raw)
+    mail_config.set_config("agently_accounts", agently_raw)
+
+
+def _load_pool() -> tuple[MailAccount, ...]:
+    smtp = [smtp_from_row(row, f"smtp-{index}") for index, row in enumerate(_group_rows("smtp_accounts"), start=1)]
+    agently = [
+        agently_from_row(row, f"agently-{index}") for index, row in enumerate(_group_rows("agently_accounts"), start=1)
+    ]
+    if smtp or agently:
+        return merge_accounts(smtp, agently)
+    unified = [
+        _unified_from_row(row, f"account-{index}") for index, row in enumerate(_group_rows("mail_accounts"), start=1)
+    ]
+    if unified:
+        split = tuple(unified)
+        _persist_split(split)
+        return split
+    legacy = _legacy_account()
+    return (legacy,) if legacy is not None else ()
 
 
 def enabled_accounts(settings: MailSettings) -> list[MailAccount]:
@@ -219,13 +293,9 @@ def load_settings() -> MailSettings:
     strategy = _str("send_strategy") or "failover"
     if strategy not in STRATEGIES:
         strategy = "failover"
-    pool = _load_pool()
-    if not pool:
-        legacy = _legacy_account()
-        pool = (legacy,) if legacy is not None else ()
     return MailSettings(
         enable_send=_bool("enable_send"),
         send_strategy=strategy,
         agently_auto_confirm=_bool("agently_auto_confirm"),
-        accounts=pool,
+        accounts=_load_pool(),
     )

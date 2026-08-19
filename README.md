@@ -17,7 +17,7 @@ GsCore 的邮件基础设施插件。给其他插件和 AI 一条统一的发信
 
 1. 把本仓库放到 GsCore 的 `plugins/gscore_mail/`
 2. 启动 Core，等依赖装完
-3. 打开网页控制台 → 插件管理 → gscore_mail，加至少一条账号，选好发送策略
+3. 打开网页控制台 → 插件管理 → gscore_mail，在「SMTP 账号」或「Agently 账号」里加至少一条，选好发送策略
 4. 私聊机器人（主人）发 `邮件状态`，再 `测试发信 你的邮箱@example.com`
 
 用 Agently 时，还要在跑 Core 的那台机器上准备 CLI：
@@ -28,24 +28,26 @@ agently-cli auth login
 agently-cli +me
 ```
 
+Windows 上 npm 会同时生成无后缀的 `#!/bin/sh` 脚本和 `agently-cli.cmd`。Python 不能直接 `CreateProcess` 它们（会报 WinError 193），本插件会改走 `node.exe` + 包内 JS 入口。控制台里路径填 `agently-cli` 或 `.cmd` 都可以，需要本机已安装 Node.js。
+
 `auth login` 会打印授权 URL，浏览器完成 OAuth 后回到终端。管理端：https://agent.qq.com
 
 同一台机器要挂**多套** Agently 时，给每条账号填不同的「Agently 隔离目录」，登录前先把该目录设成这条账号的 HOME，再执行 `auth login`。
 
 ## 邮箱池与发送策略
 
-控制台里的「邮箱账号」是一个可增删的列表。每条选类型：
+控制台里是**两组**可增删列表，不要再混在同一条里填 SMTP 和 Agently：
 
-- `smtp`：填主机（可从 Gmail / QQ / 163 等常见主机里选）、端口、用户名、授权码、加密方式
-- `agently`：填 `agently-cli` 路径，可选隔离目录
+- **SMTP 账号**：主机（可从 Gmail / QQ / 163 等常见主机里选）、端口、用户名、授权码、加密方式
+- **Agently 账号**：`agently-cli` 路径，可选隔离目录
 
-整池共用一个发送策略：
+运行时仍合成一个池，顺序是 **SMTP 列表在前，Agently 列表在后**。整池共用一个发送策略：
 
 | 策略 | 行为 |
 |------|------|
-| `failover`（默认） | 按列表顺序发。只有失败了才换下一条，SMTP 可以兜底到 Agently |
+| `failover`（默认） | 按合并后的顺序发。只有失败了才换下一条，SMTP 可以兜底到 Agently |
 | `random` | 每次从启用账号里随机抽一条，失败不换 |
-| `never` | 永远只用第一条启用账号，失败也不换 |
+| `never` | 永远只用合并后第一条启用账号，失败也不换 |
 
 关掉某条的「启用」后，它不参与发送和策略挑选。总开关 `enable_send` 关掉后，整池都不发。
 

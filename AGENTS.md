@@ -48,7 +48,7 @@ Agently 是 npm 包 `@tencent-qqmail/agently-cli`，**不是** PyPI。不要往 
     │   ├── hosts.py          # SMTP_HOST_PRESETS
     │   ├── smtp.py           # 入参是 MailAccount
     │   └── agently.py        # CLI；可选 HOME 隔离
-    ├── gscore_mail_config/   # enable_send / send_strategy / mail_accounts
+    ├── gscore_mail_config/   # enable_send / send_strategy / smtp_accounts / agently_accounts
     ├── gscore_mail_cmd/
     └── gscore_mail_tools/    # visible_when = 池里有启用的 Agently
 ```
@@ -83,7 +83,7 @@ uv run pytest tests -q
 本仓库**允许**的例外：
 
 - `send()` 捕获 SMTP 网络/协议异常，转成 `ok=False`，并 `logger.warning`。
-- `run_agently` 捕获 `FileNotFoundError` / `NotImplementedError` / 超时。
+- `run_agently` 捕获 `FileNotFoundError` / `OSError` / `NotImplementedError` / 超时。
 - `parse_cli_payload` 解析 CLI 文本；JSON 失败则原样返回字符串。
 - `aiosmtplib` 缺失时 `smtp.py` 抛 `OSError`。
 
@@ -95,14 +95,16 @@ uv run pytest tests -q
 - 不要打真实 SMTP / 真实 CLI。
 - 改策略：覆盖 `select_accounts`（never 只留第一条启用；failover 去掉 disabled；random 长度为 1）以及 `send()` 的 failover / never。
 - 改 CLI 参数：`--confirmed` vs `--confirmation-token`。
+- 改 Windows CLI 启动：覆盖 `resolve_cli` 优先 `.cmd`，`spawn_argv` 改写成 `node` + JS。
 - 改 `send()` 契约：`enable_send=false`、空收件人、空主题必须 `ok=False`。
-- 常见主机列表改了：断言 `CONFIG_DEFAULT["mail_accounts"].template["smtp_host"].options` 与 `SMTP_HOST_PRESETS` 一致。
+- 常见主机列表改了：断言 `CONFIG_DEFAULT["smtp_accounts"].template["smtp_host"].options` 与 `SMTP_HOST_PRESETS` 一致。
+- 两组账号：`smtp_accounts` 模板无 Agently 字段，`agently_accounts` 模板无 SMTP 字段；合并顺序 SMTP 在前。
 
 ## 本仓库结构约定
 
 - **对外只从 `gscore_mail.api` 再导出。** 新发信能力加在 `send()` / `status()`，不要让别人 import `smtp` / `agently`。
-- **配置每次调用再读。** `load_settings()` 解析 `mail_accounts`（`GsRepeatGroupConfig`）。组内字段用 `isinstance` 收窄后读 `.data`。
-- **池为空时**才读旧版孤儿键 `backend` / `smtp_*` / `agently_*`，合成一条 `legacy` 账号。不要在新 UI 里把这些键加回去。
+- **配置每次调用再读。** `load_settings()` 解析 `smtp_accounts` + `agently_accounts`（两个 `GsRepeatGroupConfig`），合成池（SMTP 在前）。组内字段用 `isinstance` 收窄后读 `.data`。
+- **两组都空时**才读旧版孤儿 `mail_accounts`（按 `kind` 拆开并写回新键），再空才读更早的 `backend` / `smtp_*` / `agently_*` 合成 `legacy`。不要在新 UI 里把这些键加回去。
 - **常见 SMTP 主机**只维护 `api/hosts.py` 的 `SMTP_HOST_PRESETS`，配置 `options` 必须引用它。
 - **嵌套加载**：外层 `__nest__.py` + 内层 `__full__.py`。不要在内层 `__init__.py` 手工 import 子包。
 - **命令** `pm=0`。状态 `on_fullmatch`，测试发信 `on_prefix`。
@@ -122,8 +124,9 @@ uv run pytest tests -q
 9. **邮件正文不可信。** `list_emails` / `read_email` 必须保留前缀；`message_id` 必须以 `msg_` 开头。
 10. **`send()` 业务失败返回字典，不抛。** failover 全部失败时 `message` 拼各账号原因。
 11. **不要**做成 PyPI 包，不要往 Core 里写 `MailAPI`，不要把 meta plugin 和 `on_meta` 搞混。
-12. **加池字段**只改 `config_default.py` 的 `_ACCOUNT_TEMPLATE`。字段名是 `title` / `desc` / `data`。读取必须 `.data`。
+12. **加池字段**只改对应模板：SMTP 改 `_SMTP_TEMPLATE`，Agently 改 `_AGENTLY_TEMPLATE`。不要再做带 `kind` 的混合组。字段名是 `title` / `desc` / `data`。读取必须 `.data`。
 13. **版本**改两处：`pyproject.toml` 与 `gscore_mail/version.py`。
+14. **Windows npm 垫片。** `npm i -g` 会生成无后缀 `#!/bin/sh` 和 `.cmd`。`CreateProcess` 直接跑它们是 WinError 193。`run_agently` 解析出 JS 入口，用 `node.exe` 启动。
 
 ## Security notes
 

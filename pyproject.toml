@@ -1,6 +1,6 @@
 [project]
 name = "gscore-mail"
-version = "0.2.0"
+version = "0.3.0"
 description = "GsCore 基础设施插件：SMTP + 腾讯 Agently Mail（agent.qq.com）"
 readme = "README.md"
 requires-python = ">=3.11,<4.0"

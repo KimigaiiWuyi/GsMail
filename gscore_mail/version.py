@@ -1,1 +1,1 @@
-gscore_mail_version = "0.2.0"
+gscore_mail_version = "0.3.0"

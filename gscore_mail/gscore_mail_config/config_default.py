@@ -13,10 +13,10 @@ from gsuid_core.utils.plugins_config.models import (
 
 from ..api.hosts import SMTP_HOST_PRESETS
 
-_ACCOUNT_TEMPLATE: Dict[str, GSC] = {
+_SMTP_TEMPLATE: Dict[str, GSC] = {
     "name": GsStrConfig(
         title="备注名",
-        desc="如 QQ主号 / 备用Gmail / Agently-1。永不切换时按列表第一条启用账号发",
+        desc="如 QQ主号 / 备用Gmail。永不切换时按 SMTP 列表再 Agently 列表的第一条启用账号发",
         data="",
     ),
     "enabled": GsBoolConfig(
@@ -24,15 +24,9 @@ _ACCOUNT_TEMPLATE: Dict[str, GSC] = {
         desc="关闭后不参与发送与状态检查",
         data=True,
     ),
-    "kind": GsStrConfig(
-        title="类型",
-        desc="smtp=标准 SMTP；agently=腾讯 Agently Mail（也是池里的一种）",
-        data="smtp",
-        options=["smtp", "agently"],
-    ),
     "smtp_host": GsStrConfig(
         title="SMTP 主机",
-        desc="常见服务商可直接选；其它请填完整主机名。仅 kind=smtp 时使用",
+        desc="常见服务商可直接选；其它请填完整主机名",
         data="",
         options=list(SMTP_HOST_PRESETS),
     ),
@@ -68,9 +62,22 @@ _ACCOUNT_TEMPLATE: Dict[str, GSC] = {
         desc="连接与发送超时",
         data=30,
     ),
+}
+
+_AGENTLY_TEMPLATE: Dict[str, GSC] = {
+    "name": GsStrConfig(
+        title="备注名",
+        desc="如 Agently-1。与 SMTP 备注不要重名",
+        data="",
+    ),
+    "enabled": GsBoolConfig(
+        title="启用",
+        desc="关闭后不参与发送与状态检查",
+        data=True,
+    ),
     "agently_cli": GsStrConfig(
         title="agently-cli 路径",
-        desc="仅 kind=agently。默认从 PATH 找；可填绝对路径",
+        desc="默认从 PATH 找；可填绝对路径或 agently-cli.cmd",
         data="agently-cli",
     ),
     "agently_home": GsStrConfig(
@@ -80,7 +87,7 @@ _ACCOUNT_TEMPLATE: Dict[str, GSC] = {
     ),
     "agently_timeout": GsIntConfig(
         title="CLI 超时（秒）",
-        desc="仅 kind=agently。单次 agently-cli 最长等待",
+        desc="单次 agently-cli 最长等待",
         data=60,
     ),
 }
@@ -93,7 +100,7 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     ),
     "send_strategy": GsStrConfig(
         title="发送策略",
-        desc="random=每次随机抽一个账号；failover=按列表顺序，失败才切下一个；never=永远只用第一条启用账号",
+        desc="合并顺序 SMTP 再 Agently。random=抽一条；failover=失败才切；never=只用合并后第一条",
         data="failover",
         options=["random", "failover", "never"],
     ),
@@ -102,11 +109,18 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
         desc="其它插件调用 send() 时 Agently 是否带 --confirmed。AI 工具默认仍需 confirmed=True",
         data=True,
     ),
-    "PoolSection": GsDivider("邮箱池", "SMTP 与 Agently 都是池成员", "邮箱池"),
-    "mail_accounts": GsRepeatGroupConfig(
-        title="邮箱账号",
-        desc="可添加多条 SMTP / 多条 Agently。策略作用于整个池，SMTP 失败可以兜底到 Agently",
+    "SmtpSection": GsDivider("SMTP 账号", "QQ / Gmail / 163 等标准发信", "SMTP 账号"),
+    "smtp_accounts": GsRepeatGroupConfig(
+        title="SMTP 账号",
+        desc="可添加多条。失败切换时先按本列表顺序，再试 Agently 列表",
         data=[],
-        template=_ACCOUNT_TEMPLATE,
+        template=_SMTP_TEMPLATE,
+    ),
+    "AgentlySection": GsDivider("Agently 账号", "腾讯 Agently Mail", "Agently 账号"),
+    "agently_accounts": GsRepeatGroupConfig(
+        title="Agently 账号",
+        desc="可添加多条。需本机已安装 @tencent-qqmail/agently-cli",
+        data=[],
+        template=_AGENTLY_TEMPLATE,
     ),
 }
