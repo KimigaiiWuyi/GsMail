@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from pydantic_ai import RunContext
 
+from gsuid_core.bot import Bot
+from gsuid_core.models import Event
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 
-from ..api import send, status, agently_me, agently_list, agently_read
+from ..api import send, status, agently_me, agently_list, agently_read, agently_login, resolve_send_to
 from ..api.settings import load_settings, agently_accounts
 
 
 async def _agently_visible(_ctx: RunContext[ToolContext]) -> bool:
     return bool(agently_accounts(load_settings()))
+
+
+def _master_only(ev: Event) -> tuple[bool, str]:
+    if ev.user_pm == 0:
+        return True, ""
+    return False, "仅主人可以发起 Agently 微信授权"
 
 
 @ai_tools(
@@ -25,36 +33,49 @@ async def _agently_visible(_ctx: RunContext[ToolContext]) -> bool:
     aliases=["邮件·发送邮件", "邮件·SMTP", "邮件·Agently"],
     context_tags=["邮件", "email"],
     approval="user",
-    timeout=90.0,
+    timeout=360.0,
 )
 async def send_email(
-    to: str,
+    bot: Bot,
+    ev: Event,
     subject: str,
     body: str,
+    to: str = "",
     cc: str = "",
     confirmed: bool = False,
 ) -> str:
     """
-    发送一封电子邮件。收件人、主题、正文必填。走控制台配置的邮箱池与发送策略。
+    发送一封电子邮件。主题、正文必填。走控制台配置的邮箱池与发送策略。
+
+    用户说「给我发」且未给邮箱时：OneBot / QQ 通道自动用 当前用户QQ号@qq.com，不要再追问邮箱。
+    Agently 未授权时本工具会自己推微信授权链接给主人并等待扫码，然后再发；不要自己先调授权工具。
 
     Args:
-        to: 收件人，多个用逗号分隔
         subject: 邮件主题
         body: 正文（只写用户要求传达的内容，不要加 Agent 签名）
+        to: 收件人，多个用逗号分隔；可空（QQ / OneBot 默认当前用户QQ号@qq.com）
         cc: 抄送，可空，多个用逗号分隔
         confirmed: Agently 账号为 True 时带 --confirmed；SMTP 忽略此项
     """
+    target = resolve_send_to(to, ev.bot_id, ev.user_id)
+    if not target:
+        return "收件人为空。非 QQ 通道请向用户要完整邮箱地址"
+
+    async def on_auth_url(url: str) -> None:
+        await bot.send(f"Agently 需要微信授权。请主人打开此链接（不要改）：\n{url}\n扫码成功后会继续发刚才那封信。")
+
     result = await send(
-        to=to,
+        to=target,
         subject=subject,
         body=body,
         cc=cc or None,
         confirmed=confirmed,
+        on_auth_url=on_auth_url,
     )
     label = result["account"] or result["backend"]
     if result["ok"]:
-        return f"发送成功（{label}）：{result['message']}"
-    return f"发送失败（{label}）：{result['message']}"
+        return f"发送成功（{label}）→ {target}：{result['message']}"
+    return f"发送失败（{label}）→ {target}：{result['message']}"
 
 
 @ai_tools(
@@ -70,6 +91,28 @@ async def mail_status() -> str:
     flag = "允许发送" if st["enable_send"] else "禁止发送"
     ready = "已配置" if st["configured"] else "未就绪"
     return f"后端={st['backend']} {ready} {flag}。\n{st['detail']}"
+
+
+@ai_tools(
+    category="common",
+    capability_domain="邮件发送",
+    covers=["启动腾讯 Agently Mail 微信 OAuth（agently-cli auth login）"],
+    aliases=["邮件·Agently授权", "邮件·扫码登录"],
+    context_tags=["邮件", "email"],
+    visible_when=_agently_visible,
+    check_func=_master_only,
+    timeout=90.0,
+)
+async def agently_auth_login(account: str = "") -> str:
+    """
+    启动 Agently Mail 微信授权。会返回一条必须原样打开的链接，请发给主人用微信扫码。
+    失败或超时不要重试本工具，把原文告诉主人。
+
+    Args:
+        account: 邮箱池里的备注名；留空则用第一条启用的 Agently
+    """
+    result = await agently_login(account)
+    return result["message"]
 
 
 @ai_tools(

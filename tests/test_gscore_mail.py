@@ -13,9 +13,17 @@ _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from gscore_mail.api import send as mail_send
+from gscore_mail.api import send as mail_send, infer_qq_mail
 from gscore_mail.api.hosts import SMTP_HOST_PRESETS
-from gscore_mail.api.agently import send_args, spawn_argv, resolve_cli, parse_cli_payload
+from gscore_mail.api.agently import (
+    send_args,
+    spawn_argv,
+    resolve_cli,
+    is_auth_error,
+    extract_login_url,
+    parse_cli_payload,
+    agently_error_message,
+)
 from gscore_mail.api.settings import (
     MailAccount,
     MailSettings,
@@ -383,6 +391,112 @@ def test_never_does_not_switch(monkeypatch: pytest.MonkeyPatch) -> None:
         assert result["ok"] is False
         assert result["account"] == "qq"
         assert called["agently"] == 0
+
+    asyncio.run(_run())
+
+
+def test_infer_qq_mail_onebot_only() -> None:
+    assert infer_qq_mail("onebot", "444835641") == "444835641@qq.com"
+    assert infer_qq_mail("qqgroup", "12345") == "12345@qq.com"
+    assert infer_qq_mail("discord", "444835641") == ""
+    assert infer_qq_mail("onebot", "abc") == ""
+
+
+def test_extract_login_url_prefers_agent_qq() -> None:
+    text = "open https://example.com/x and https://agent.qq.com/auth?code=1 please"
+    assert extract_login_url(text) == "https://agent.qq.com/auth?code=1"
+
+
+def test_agently_auth_error_is_human() -> None:
+    payload = {"ok": False, "error": {"type": "auth", "message": "authorization required"}}
+    assert is_auth_error(payload) is True
+    msg = agently_error_message(payload, 3)
+    assert "授权" in msg
+    assert "authorization required" not in msg
+
+
+class _FakeLogin:
+    def __init__(self, url: str, exit_code: int) -> None:
+        self.text = f"open {url}" if url else "no url"
+        self.done = asyncio.Event()
+        self.done.set()
+        self.exit_code = exit_code
+        self.notified = False
+        self._url = url
+
+    def url(self) -> str:
+        return self._url
+
+    async def wait_url(self, seconds: float) -> str:
+        return self._url
+
+    async def wait_done(self, seconds: float) -> bool:
+        return True
+
+
+def test_send_agently_auth_retries_after_oauth(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api as api_mod
+
+    sent: list[str] = []
+    calls: list[list[str]] = []
+
+    async def fake_run(cli: str, args: list[str], timeout: int, home: str = "") -> dict[str, object]:
+        calls.append(args)
+        if args[:2] == ["message", "+send"] and sum(1 for item in calls if item[:2] == ["message", "+send"]) == 1:
+            return {
+                "exit_code": 3,
+                "stdout": '{"ok":false,"error":{"type":"auth","message":"authorization required"}}',
+                "stderr": "",
+            }
+        return {"exit_code": 0, "stdout": "ok", "stderr": ""}
+
+    async def fake_login(cli: str, home: str, key: str, ttl: int = 300) -> _FakeLogin:
+        return _FakeLogin("https://agent.qq.com/auth?x=1", 0)
+
+    async def fake_master(message: object) -> None:
+        sent.append(str(message))
+
+    async def _run() -> None:
+        settings = _settings(accounts=(_account(name="AG", kind="agently"),))
+        monkeypatch.setattr(api_mod, "load_settings", lambda: settings)
+        monkeypatch.setattr(api_mod.agently_backend, "run_agently", fake_run)
+        monkeypatch.setattr(api_mod.agently_backend, "begin_auth_login", fake_login)
+        monkeypatch.setattr(api_mod, "send_msg_to_master", fake_master)
+        result = await mail_send(to="a@b.c", subject="S", body="B")
+        assert result["ok"] is True
+        assert any("agent.qq.com" in item for item in sent)
+        assert sum(1 for item in calls if item[:2] == ["message", "+send"]) == 2
+
+    asyncio.run(_run())
+
+
+def test_send_agently_auth_login_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api as api_mod
+
+    async def fake_run(cli: str, args: list[str], timeout: int, home: str = "") -> dict[str, object]:
+        if args[:2] == ["message", "+send"]:
+            return {
+                "exit_code": 3,
+                "stdout": '{"ok":false,"error":{"type":"auth","message":"authorization required"}}',
+                "stderr": "",
+            }
+        return {"exit_code": 3, "stdout": "still unauthorized", "stderr": ""}
+
+    async def fake_login(cli: str, home: str, key: str, ttl: int = 300) -> _FakeLogin:
+        return _FakeLogin("https://agent.qq.com/auth?x=1", 1)
+
+    async def fake_master(message: object) -> None:
+        return None
+
+    async def _run() -> None:
+        settings = _settings(accounts=(_account(name="AG", kind="agently"),))
+        monkeypatch.setattr(api_mod, "load_settings", lambda: settings)
+        monkeypatch.setattr(api_mod.agently_backend, "run_agently", fake_run)
+        monkeypatch.setattr(api_mod.agently_backend, "begin_auth_login", fake_login)
+        monkeypatch.setattr(api_mod, "send_msg_to_master", fake_master)
+        result = await mail_send(to="a@b.c", subject="S", body="B")
+        assert result["ok"] is False
+        assert "agent.qq.com" in result["message"]
 
     asyncio.run(_run())
 

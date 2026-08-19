@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypedDict
+from collections.abc import Callable, Awaitable
 
 from gsuid_core.logger import logger
+from gsuid_core.utils.message import send_msg_to_master
 
 from . import agently as agently_backend
 from .smtp import send_smtp
@@ -36,6 +38,26 @@ class MailStatus(TypedDict):
     enable_send: bool
     configured: bool
     detail: str
+
+
+_QQ_BOTS = frozenset({"onebot", "onebot_v11", "onebot_v12", "qqgroup"})
+
+
+def infer_qq_mail(bot_id: str, user_id: str) -> str:
+    """OneBot / QQ 官方通道：数字 user_id 可写成 user_id@qq.com。"""
+    if bot_id not in _QQ_BOTS:
+        return ""
+    uid = user_id.strip()
+    if not uid.isdigit():
+        return ""
+    return f"{uid}@qq.com"
+
+
+def resolve_send_to(to: str, bot_id: str, user_id: str) -> str:
+    raw = to.strip()
+    if raw:
+        return raw
+    return infer_qq_mail(bot_id, user_id)
 
 
 def _as_addr_list(value: str | list[str] | None) -> list[str]:
@@ -92,7 +114,55 @@ async def _send_smtp_account(
     return _ok("smtp", f"已通过 SMTP 发送（{label}）", label)
 
 
-async def _send_agently_account(
+async def _push_auth_url(
+    url: str,
+    label: str,
+    session: agently_backend.AgentlyLoginSession,
+    on_auth_url: Callable[[str], Awaitable[None]] | None,
+) -> None:
+    if session.notified:
+        return
+    session.notified = True
+    text = (
+        f"[gscore_mail] Agently（{label}）需要微信授权。请打开此链接（不要改）：\n"
+        f"{url}\n扫码成功后会自动继续刚才的发信。"
+    )
+    await send_msg_to_master(text)
+    if on_auth_url is not None:
+        await on_auth_url(url)
+
+
+async def _complete_agently_oauth(
+    account: MailAccount,
+    on_auth_url: Callable[[str], Awaitable[None]] | None,
+) -> MailSendResult:
+    label = account_label(account)
+    started = await agently_backend.begin_auth_login(
+        account.agently_cli,
+        account.agently_home,
+        label,
+    )
+    if isinstance(started, dict):
+        return _fail("agently", started["stderr"] or started["stdout"], label, started["stderr"])
+    url = await started.wait_url(agently_backend.LOGIN_URL_WAIT)
+    if url:
+        await _push_auth_url(url, label, started, on_auth_url)
+    await started.wait_done(agently_backend.LOGIN_PROCESS_TTL)
+    me = await agently_backend.run_agently(
+        account.agently_cli,
+        ["+me"],
+        account.agently_timeout,
+        account.agently_home,
+    )
+    if me["exit_code"] == 0:
+        return _ok("agently", (me["stdout"] or me["stderr"]).strip() or "授权已完成", label, me["stdout"])
+    if url:
+        return _fail("agently", f"已向主人推送授权链接，但尚未完成扫码：{url}", label, started.text)
+    payload = agently_backend.parse_cli_payload(started.text or me["stdout"] or me["stderr"])
+    return _fail("agently", agently_backend.agently_error_message(payload, me["exit_code"]), label, started.text)
+
+
+async def _send_agently_once(
     account: MailAccount,
     to_list: list[str],
     subject: str,
@@ -101,7 +171,7 @@ async def _send_agently_account(
     bcc_list: list[str],
     confirmed: bool,
     confirmation_token: str,
-) -> MailSendResult:
+) -> tuple[MailSendResult, object]:
     label = account_label(account)
     args = agently_backend.send_args(
         to_list,
@@ -118,11 +188,52 @@ async def _send_agently_account(
         account.agently_timeout,
         account.agently_home,
     )
-    payload = agently_backend.parse_cli_payload(run["stdout"] or run["stderr"])
     raw = run["stdout"] or run["stderr"]
+    payload = agently_backend.parse_cli_payload(raw)
     if run["exit_code"] == 0:
-        return _ok("agently", f"已通过 Agently Mail 发送（{label}）", label, raw)
-    return _fail("agently", f"agently-cli 退出码 {run['exit_code']}: {payload}", label, raw)
+        return _ok("agently", f"已通过 Agently Mail 发送（{label}）", label, raw), payload
+    return _fail("agently", agently_backend.agently_error_message(payload, run["exit_code"]), label, raw), payload
+
+
+async def _send_agently_account(
+    account: MailAccount,
+    to_list: list[str],
+    subject: str,
+    body: str,
+    cc_list: list[str],
+    bcc_list: list[str],
+    confirmed: bool,
+    confirmation_token: str,
+    on_auth_url: Callable[[str], Awaitable[None]] | None,
+    resume_auth: bool,
+) -> MailSendResult:
+    last, payload = await _send_agently_once(
+        account,
+        to_list,
+        subject,
+        body,
+        cc_list,
+        bcc_list,
+        confirmed,
+        confirmation_token,
+    )
+    if last["ok"] or not resume_auth or not agently_backend.is_auth_error(payload):
+        return last
+    logger.warning(f"gscore_mail Agently 未授权 [{account_label(account)}]，启动 OAuth")
+    login = await _complete_agently_oauth(account, on_auth_url)
+    if not login["ok"]:
+        return login
+    retried, _payload = await _send_agently_once(
+        account,
+        to_list,
+        subject,
+        body,
+        cc_list,
+        bcc_list,
+        confirmed,
+        confirmation_token,
+    )
+    return retried
 
 
 async def send(
@@ -134,10 +245,12 @@ async def send(
     html: bool = False,
     confirmed: bool | None = None,
     confirmation_token: str = "",
+    on_auth_url: Callable[[str], Awaitable[None]] | None = None,
 ) -> MailSendResult:
     """按邮箱池与发送策略发信。
 
     ``confirmed`` 仅对 agently 有效：None 时库调用跟随 ``agently_auto_confirm``。
+    Agently 未授权时会拉起 ``auth login``，把链接推给主人，等扫码后再发一次。
     """
     settings = load_settings()
     backend = _pool_backend(settings)
@@ -170,6 +283,8 @@ async def send(
                 bcc_list,
                 use_confirmed,
                 confirmation_token,
+                on_auth_url,
+                True,
             )
         else:
             last = await _send_smtp_account(
@@ -198,8 +313,11 @@ async def _agently_status_line(account: MailAccount) -> tuple[bool, str]:
         account.agently_timeout,
         account.agently_home,
     )
-    detail = (run["stdout"] or run["stderr"]).strip() or f"exit={run['exit_code']}"
-    return run["exit_code"] == 0, detail
+    raw = (run["stdout"] or run["stderr"]).strip() or f"exit={run['exit_code']}"
+    if run["exit_code"] == 0:
+        return True, raw
+    payload = agently_backend.parse_cli_payload(raw)
+    return False, agently_backend.agently_error_message(payload, run["exit_code"])
 
 
 async def status() -> MailStatus:
@@ -266,7 +384,42 @@ async def agently_me(account_name: str = "") -> MailSendResult:
     label = account_label(picked)
     if run["exit_code"] == 0:
         return _ok("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)
-    return _fail("agently", raw.strip() or f"exit={run['exit_code']}", label, raw)
+    payload = agently_backend.parse_cli_payload(raw)
+    return _fail("agently", agently_backend.agently_error_message(payload, run["exit_code"]), label, raw)
+
+
+async def agently_login(account_name: str = "") -> MailSendResult:
+    """启动 ``agently-cli auth login``，尽快抽出微信授权 URL。进程在后台等到扫码或超时。"""
+    settings = load_settings()
+    picked = _pick_agently(settings, account_name)
+    if not isinstance(picked, MailAccount):
+        return picked
+    label = account_label(picked)
+    started = await agently_backend.begin_auth_login(
+        picked.agently_cli,
+        picked.agently_home,
+        label,
+    )
+    if isinstance(started, dict):
+        return _fail("agently", started["stderr"] or started["stdout"], label, started["stderr"])
+    url = await started.wait_url(agently_backend.LOGIN_URL_WAIT)
+    if url:
+        return _ok(
+            "agently",
+            f"请用微信打开此链接完成 Agently 授权（不要改链接）：\n{url}\n"
+            "页面显示登录成功后，发「邮件状态」或让 AI 再查一次 agently_whoami。",
+            label,
+            started.text,
+        )
+    if started.done.is_set():
+        payload = agently_backend.parse_cli_payload(started.text)
+        return _fail(
+            "agently",
+            agently_backend.agently_error_message(payload, started.exit_code),
+            label,
+            started.text,
+        )
+    return _fail("agently", "等待授权链接超时。请确认本机已安装 CLI，然后重试「邮件授权」。", label, started.text)
 
 
 async def agently_list(dir_name: str = "inbox", limit: int = 10, account_name: str = "") -> MailSendResult:

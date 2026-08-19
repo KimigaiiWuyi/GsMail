@@ -10,29 +10,22 @@ GsCore 的邮件基础设施插件。给其他插件和 AI 一条统一的发信
 
 - 其他插件一行 `await send(...)` 发邮件，不用各自对接 SMTP
 - 网页控制台里维护邮箱池、选发送策略、开关发送
-- 主人在聊天里查整池状态、发测试信
-- AI 可以调 `send_email` / `mail_status`；池里有 Agently 时还能查账号、列收件箱、读一封信
+- 主人在聊天里查整池状态、做 Agently 微信授权、发测试信
+- AI 可以调 `send_email` / `mail_status`；池里有 Agently 时还能授权、查账号、列收件箱、读一封信
 
 ## 安装
 
 1. 把本仓库放到 GsCore 的 `plugins/gscore_mail/`
 2. 启动 Core，等依赖装完
 3. 打开网页控制台 → 插件管理 → gscore_mail，在「SMTP 账号」或「Agently 账号」里加至少一条，选好发送策略
-4. 私聊机器人（主人）发 `邮件状态`，再 `测试发信 你的邮箱@example.com`
+4. 用 Agently 时：本机先 `npm install -g @tencent-qqmail/agently-cli`，再让**主人**对机器人发 `邮件授权`，用微信打开链接扫码
+5. 主人发 `邮件状态`，看到 Agently 就绪后再 `测试发信`（QQ / OneBot 可不填地址，默认 `你的QQ号@qq.com`）
 
-用 Agently 时，还要在跑 Core 的那台机器上准备 CLI：
+只在控制台加一条 Agently 账号**不够**。腾讯 Agently Mail 走 OAuth 设备码。发信时如果 CLI 返回未授权，`send()` 会自己拉起 `auth login`，把链接推给主人，等微信扫码完成后再发那封信。也可以预先发 `邮件授权`。这和下面说的 AI 审批不是一回事。
 
-```bash
-npm install -g @tencent-qqmail/agently-cli
-agently-cli auth login
-agently-cli +me
-```
+Windows 上 npm 会同时生成无后缀的 `#!/bin/sh` 脚本和 `agently-cli.cmd`。本插件会改走 `node.exe` + 包内 JS 入口。控制台路径填 `agently-cli` 或 `.cmd` 都可以。
 
-Windows 上 npm 会同时生成无后缀的 `#!/bin/sh` 脚本和 `agently-cli.cmd`。Python 不能直接 `CreateProcess` 它们（会报 WinError 193），本插件会改走 `node.exe` + 包内 JS 入口。控制台里路径填 `agently-cli` 或 `.cmd` 都可以，需要本机已安装 Node.js。
-
-`auth login` 会打印授权 URL，浏览器完成 OAuth 后回到终端。管理端：https://agent.qq.com
-
-同一台机器要挂**多套** Agently 时，给每条账号填不同的「Agently 隔离目录」，登录前先把该目录设成这条账号的 HOME，再执行 `auth login`。
+同一台机器要挂**多套** Agently 时，给每条账号填不同的「Agently 隔离目录」，每条都要单独 `邮件授权`。管理端：https://agent.qq.com
 
 ## 邮箱池与发送策略
 
@@ -77,7 +70,9 @@ from gscore_mail.api import send
 result = await send(to="ops@example.com", subject="告警", body=text)
 ```
 
-`send()` 还支持 `cc` / `bcc`、SMTP 的 `html=True`，以及 Agently 的 `confirmed` / `confirmation_token`。返回值是字典：`ok`、`backend`、`message`、`raw`、`account`（实际用到的备注名）。
+`send()` 是库函数，**不经过** AI 工具的 `approval`。其它插件直接 `await send(...)` 就会发，不需要主人在聊天里点同意。AI 的 `send_email` 才要当前用户批一次（防模型自己乱发）。
+
+`send()` 还支持 `cc` / `bcc`、SMTP 的 `html=True`，以及 Agently 的 `confirmed` / `confirmation_token`。返回值是字典：`ok`、`backend`、`message`、`raw`、`account`（实际用到的备注名）。QQ / OneBot 收件人可用 `infer_qq_mail(bot_id, user_id)`。
 
 查整池是否就绪：
 
@@ -95,15 +90,16 @@ st = await status()
 | 命令 | 作用 |
 |------|------|
 | `邮件状态` / `mailstatus` | 看策略、池内各账号是否就绪、发送开关 |
-| `测试发信 user@example.com` / `mailtest …` | 按当前策略发一封测试信 |
+| `邮件授权` / `maillogin` [备注名] | 拉起 Agently 微信扫码链接（OAuth） |
+| `测试发信` / `mailtest` [邮箱] | 按当前策略发一封测试信；QQ / OneBot 可不填地址 |
 
 ## AI 工具
 
-始终可用：`send_email`、`mail_status`。
+始终可用：`send_email`（`approval="user"`，当前说话人批一次，**不是**主人专属）、`mail_status`。
 
-池里有启用的 Agently 时额外出现：`agently_whoami`、`list_emails`、`read_email`（可用备注名指定哪一条）。
+池里有启用的 Agently 时额外出现：`agently_auth_login`（仅主人）、`agently_whoami`、`list_emails`、`read_email`。
 
-库 API 默认会带 Agently 的 `--confirmed`（可在配置里关掉）。AI 发信默认不带，需要模型传入 `confirmed=True`。读到的邮件正文按不可信外部输入处理，不要当指令执行。
+用户说「给我发」且没给邮箱时，OneBot / QQ 通道自动用 `user_id@qq.com`。Agently 未授权时 `send_email` 会把扫码链接发给当前会话和主人，等授权完成后再发，不必先单独调授权工具。库 API 默认会带 Agently 的 `--confirmed`（可在配置里关掉）。AI 发信默认不带，需要模型传入 `confirmed=True`。读到的邮件正文按不可信外部输入处理，不要当指令执行。
 
 ## 更多
 

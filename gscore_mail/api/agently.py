@@ -160,10 +160,94 @@ def _cli_env(home: str) -> dict[str, str] | None:
     return env
 
 
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+LOGIN_URL_WAIT = 45
+LOGIN_PROCESS_TTL = 300
+
+
+class AgentlyLoginSession:
+    def __init__(self) -> None:
+        self.text = ""
+        self.done = asyncio.Event()
+        self.exit_code = 1
+        self.notified = False
+        self._proc: asyncio.subprocess.Process | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    def url(self) -> str:
+        return extract_login_url(self.text)
+
+    async def wait_url(self, seconds: float) -> str:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        while True:
+            found = self.url()
+            if found or self.done.is_set():
+                return found
+            left = deadline - loop.time()
+            if left <= 0:
+                return self.url()
+            try:
+                await asyncio.wait_for(self.done.wait(), timeout=min(0.25, left))
+            except asyncio.TimeoutError:
+                continue
+
+    async def wait_done(self, seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self.done.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def close(self) -> None:
+        if self._proc is not None and self._proc.returncode is None:
+            self._proc.kill()
+            await self._proc.communicate()
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+
+
+def extract_login_url(text: str) -> str:
+    urls: list[str] = []
+    for match in _URL_RE.finditer(text):
+        urls.append(match.group(0).rstrip(").,;]"))
+    for url in urls:
+        if "agent.qq.com" in url:
+            return url
+    for url in urls:
+        if "qq.com" in url:
+            return url
+    return urls[0] if urls else ""
+
+
+_login_sessions: dict[str, AgentlyLoginSession] = {}
+
+
+def is_auth_error(payload: object) -> bool:
+    if isinstance(payload, dict) and "error" in payload:
+        err = payload["error"]
+        if isinstance(err, dict) and "type" in err:
+            return err["type"] == "auth"
+    if isinstance(payload, str):
+        return "authorization required" in payload.lower()
+    return False
+
+
+def agently_error_message(payload: object, exit_code: int) -> str:
+    if is_auth_error(payload):
+        return "Agently 尚未微信授权。正在向主人推送扫码链接，完成后会自动重试发信"
+    if isinstance(payload, dict) and "error" in payload:
+        err = payload["error"]
+        if isinstance(err, dict) and "message" in err and isinstance(err["message"], str):
+            return f"agently-cli 退出码 {exit_code}: {err['message']}"
+    return f"agently-cli 退出码 {exit_code}: {payload}"
+
+
 async def _spawn(argv: list[str], env: dict[str, str] | None) -> asyncio.subprocess.Process:
     if os.name == "nt":
         return await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -171,6 +255,7 @@ async def _spawn(argv: list[str], env: dict[str, str] | None) -> asyncio.subproc
         )
     return await asyncio.create_subprocess_exec(
         *argv,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
@@ -223,6 +308,82 @@ async def run_agently(cli: str, args: list[str], timeout: int, home: str = "") -
         "stdout": out_b.decode("utf-8", errors="replace"),
         "stderr": err_b.decode("utf-8", errors="replace"),
     }
+
+
+async def _drive_login(session: AgentlyLoginSession, ttl: int) -> None:
+    proc = session._proc
+    if proc is None:
+        session.done.set()
+        return
+
+    async def _pump(stream: asyncio.StreamReader | None) -> None:
+        if stream is None:
+            return
+        while True:
+            data = await stream.read(1024)
+            if not data:
+                return
+            session.text += data.decode("utf-8", errors="replace")
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(_pump(proc.stdout), _pump(proc.stderr), proc.wait()),
+            timeout=ttl,
+        )
+    except asyncio.TimeoutError:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.communicate()
+        session.text += f"\nagently-cli auth login 超时（{ttl}s）"
+    session.exit_code = proc.returncode if proc.returncode is not None else 1
+    session.done.set()
+
+
+async def begin_auth_login(
+    cli: str, home: str, key: str, ttl: int = LOGIN_PROCESS_TTL
+) -> AgentlyLoginSession | AgentlyRunResult:
+    if key in _login_sessions:
+        existing = _login_sessions[key]
+        if not existing.done.is_set():
+            return existing
+        await existing.close()
+        del _login_sessions[key]
+
+    exe = resolve_cli(cli)
+    argv = spawn_argv(exe, ["auth", "login"])
+    if _windows_needs_pe(argv[0]):
+        return {
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": (
+                f"Windows 无法直接执行 npm 脚本（{exe}）。请安装 Node.js，并确认已 npm i -g @tencent-qqmail/agently-cli"
+            ),
+        }
+    env = _cli_env(home)
+    session = AgentlyLoginSession()
+    try:
+        session._proc = await _spawn(argv, env)
+    except FileNotFoundError:
+        return {
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": f"未找到 agently-cli（当前配置: {exe}）。请 npm i -g @tencent-qqmail/agently-cli",
+        }
+    except OSError as exc:
+        return {
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": f"无法启动 agently-cli（{exe}）：{exc}",
+        }
+    except NotImplementedError:
+        return {
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": "当前事件循环不支持异步子进程，无法调用 agently-cli",
+        }
+    session._task = asyncio.create_task(_drive_login(session, ttl))
+    _login_sessions[key] = session
+    return session
 
 
 def parse_cli_payload(text: str) -> object:

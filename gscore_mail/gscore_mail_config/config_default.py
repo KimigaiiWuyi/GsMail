@@ -119,7 +119,7 @@ CONFIG_DEFAULT: Dict[str, GSC] = {
     "AgentlySection": GsDivider("Agently 账号", "腾讯 Agently Mail", "Agently 账号"),
     "agently_accounts": GsRepeatGroupConfig(
         title="Agently 账号",
-        desc="可添加多条。需本机已安装 @tencent-qqmail/agently-cli",
+        desc="可添加多条。装好 CLI 后主人必须发「邮件授权」微信扫码，未授权不能发信",
         data=[],
         template=_AGENTLY_TEMPLATE,
     ),

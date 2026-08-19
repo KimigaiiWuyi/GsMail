@@ -97,6 +97,7 @@ uv run pytest tests -q
 - 改 CLI 参数：`--confirmed` vs `--confirmation-token`。
 - 改 Windows CLI 启动：覆盖 `resolve_cli` 优先 `.cmd`，`spawn_argv` 改写成 `node` + JS。
 - 改 `send()` 契约：`enable_send=false`、空收件人、空主题必须 `ok=False`。
+- Agently `error.type=auth`：`send()` 会走 OAuth 再发一次。`infer_qq_mail` 只对 onebot / qq 数字 ID。
 - 常见主机列表改了：断言 `CONFIG_DEFAULT["smtp_accounts"].template["smtp_host"].options` 与 `SMTP_HOST_PRESETS` 一致。
 - 两组账号：`smtp_accounts` 模板无 Agently 字段，`agently_accounts` 模板无 SMTP 字段；合并顺序 SMTP 在前。
 
@@ -107,8 +108,8 @@ uv run pytest tests -q
 - **两组都空时**才读旧版孤儿 `mail_accounts`（按 `kind` 拆开并写回新键），再空才读更早的 `backend` / `smtp_*` / `agently_*` 合成 `legacy`。不要在新 UI 里把这些键加回去。
 - **常见 SMTP 主机**只维护 `api/hosts.py` 的 `SMTP_HOST_PRESETS`，配置 `options` 必须引用它。
 - **嵌套加载**：外层 `__nest__.py` + 内层 `__full__.py`。不要在内层 `__init__.py` 手工 import 子包。
-- **命令** `pm=0`。状态 `on_fullmatch`，测试发信 `on_prefix`。
-- **AI 工具** `category="common"`，带 `covers` / `aliases`。`send_email` 保持 `approval="user"`。Agently 三个工具 `visible_when` 看池里是否有启用的 `kind=agently`。
+- **命令** `pm=0`。状态 `on_fullmatch`；测试发信 / 邮件授权 `on_command`（参数可选）。
+- **AI 工具** `category="common"`，带 `covers` / `aliases`。`send_email` 保持 `approval="user"`（只挡 AI 工具，不挡 `send()`）。`agently_auth_login` 仅主人。Agently 工具 `visible_when` 看池里是否有启用的 Agently。
 - `select_accounts` 是纯函数，单测直接喂 `MailAccount` 列表，不要为它 mock 配置文件。
 
 ## 坑点
@@ -127,6 +128,8 @@ uv run pytest tests -q
 12. **加池字段**只改对应模板：SMTP 改 `_SMTP_TEMPLATE`，Agently 改 `_AGENTLY_TEMPLATE`。不要再做带 `kind` 的混合组。字段名是 `title` / `desc` / `data`。读取必须 `.data`。
 13. **版本**改两处：`pyproject.toml` 与 `gscore_mail/version.py`。
 14. **Windows npm 垫片。** `npm i -g` 会生成无后缀 `#!/bin/sh` 和 `.cmd`。`CreateProcess` 直接跑它们是 WinError 193。`run_agently` 解析出 JS 入口，用 `node.exe` 启动。
+15. **Agently 必须 OAuth。** `send()` 遇到 `auth` 会自动 `auth login`、把链接推给主人（`send_msg_to_master` + 可选 `on_auth_url`）、等扫码后再发一次。进行中的 login 要复用；失败/超时不要再开第二次。
+16. **`approval="user"` ≠ 库审批。** 其它插件 `from gscore_mail.api import send` 直接发。OneBot 没给收件人时用 `user_id@qq.com`。
 
 ## Security notes
 
