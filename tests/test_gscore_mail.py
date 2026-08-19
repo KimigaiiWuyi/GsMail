@@ -22,7 +22,9 @@ from gscore_mail.api.agently import (
     is_auth_error,
     extract_login_url,
     parse_cli_payload,
+    extract_message_id,
     agently_error_message,
+    extract_confirmation_token,
 )
 from gscore_mail.api.settings import (
     MailAccount,
@@ -273,6 +275,14 @@ def test_parse_cli_payload_json_and_text() -> None:
     assert parse_cli_payload("  ") == ""
 
 
+def test_extract_confirmation_token_and_message_id() -> None:
+    pending = {"ok": True, "data": {"confirmation_token": "ctk_abc", "summary": "send?"}}
+    assert extract_confirmation_token(pending) == "ctk_abc"
+    assert extract_confirmation_token("please confirm ctk_xyz") == "ctk_xyz"
+    assert extract_message_id({"ok": True, "data": {"id": "msg_1"}}) == "msg_1"
+    assert extract_confirmation_token({"ok": True, "id": "msg_1"}) == ""
+
+
 def test_send_disabled_and_empty_to(monkeypatch: pytest.MonkeyPatch) -> None:
     import gscore_mail.api as api_mod
 
@@ -328,6 +338,55 @@ def test_send_agently_uses_cli(monkeypatch: pytest.MonkeyPatch) -> None:
         assert result["backend"] == "agently"
         assert captured
         assert "--confirmed" in captured[0]
+
+    asyncio.run(_run())
+
+
+def test_send_agently_pending_token_is_not_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api as api_mod
+
+    async def fake_run(cli: str, args: list[str], timeout: int, home: str = "") -> dict[str, object]:
+        return {
+            "exit_code": 0,
+            "stdout": '{"ok":true,"data":{"confirmation_token":"ctk_hold","summary":"send?"}}',
+            "stderr": "",
+        }
+
+    async def _run() -> None:
+        settings = _settings(accounts=(_account(name="AG", kind="agently"),), agently_auto_confirm=False)
+        monkeypatch.setattr(api_mod, "load_settings", lambda: settings)
+        monkeypatch.setattr(api_mod.agently_backend, "run_agently", fake_run)
+        result = await mail_send(to="to@ex.com", subject="S", body="B", confirmed=False)
+        assert result["ok"] is False
+        assert "尚未发出" in result["message"]
+        assert "ctk_hold" in result["message"]
+
+    asyncio.run(_run())
+
+
+def test_send_agently_retries_confirmation_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    import gscore_mail.api as api_mod
+
+    calls: list[list[str]] = []
+
+    async def fake_run(cli: str, args: list[str], timeout: int, home: str = "") -> dict[str, object]:
+        calls.append(args)
+        if "--confirmation-token" in args:
+            return {"exit_code": 0, "stdout": '{"ok":true,"id":"msg_9"}', "stderr": ""}
+        return {
+            "exit_code": 0,
+            "stdout": '{"ok":true,"data":{"confirmation_token":"ctk_go"}}',
+            "stderr": "",
+        }
+
+    async def _run() -> None:
+        settings = _settings(accounts=(_account(name="AG", kind="agently"),))
+        monkeypatch.setattr(api_mod, "load_settings", lambda: settings)
+        monkeypatch.setattr(api_mod.agently_backend, "run_agently", fake_run)
+        result = await mail_send(to="to@ex.com", subject="S", body="B", confirmed=True)
+        assert result["ok"] is True
+        assert "msg_9" in result["message"]
+        assert any("--confirmation-token" in item and "ctk_go" in item for item in calls)
 
     asyncio.run(_run())
 

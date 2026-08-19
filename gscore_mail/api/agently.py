@@ -397,6 +397,58 @@ def parse_cli_payload(text: str) -> object:
         return stripped
 
 
+_CTK_RE = re.compile(r"ctk_[A-Za-z0-9_-]+")
+_MSG_RE = re.compile(r"msg_[A-Za-z0-9_-]+")
+_TOKEN_KEYS = ("confirmation_token", "confirmationToken", "token")
+
+
+def extract_confirmation_token(payload: object) -> str:
+    """两阶段确认的第一阶段会返回 ctk_；有令牌说明还没真正发出。"""
+    if isinstance(payload, str):
+        match = _CTK_RE.search(payload)
+        return match.group(0) if match else ""
+    if not isinstance(payload, dict):
+        return ""
+    for key in _TOKEN_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, str) and value.startswith("ctk_"):
+            return value
+    if "data" in payload:
+        nested = extract_confirmation_token(payload["data"])
+        if nested:
+            return nested
+    for value in payload.values():
+        found = extract_confirmation_token(value)
+        if found:
+            return found
+    return ""
+
+
+def extract_message_id(payload: object) -> str:
+    if isinstance(payload, str):
+        match = _MSG_RE.search(payload)
+        return match.group(0) if match else ""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("id", "message_id", "messageId"):
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, str) and value.startswith("msg_"):
+            return value
+    if "data" in payload:
+        nested = extract_message_id(payload["data"])
+        if nested:
+            return nested
+    return ""
+
+
+def payload_rejected(payload: object) -> bool:
+    return isinstance(payload, dict) and "ok" in payload and payload["ok"] is False
+
+
 def send_args(
     to: list[str],
     subject: str,

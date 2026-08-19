@@ -49,13 +49,14 @@ async def send_email(
 
     用户说「给我发」且未给邮箱时：OneBot / QQ 通道自动用 当前用户QQ号@qq.com，不要再追问邮箱。
     Agently 未授权时本工具会自己推微信授权链接给主人并等待扫码，然后再发；不要自己先调授权工具。
+    本工具带用户审批，真正执行时会对 Agently 带 --confirmed，否则 CLI 只返回确认令牌、邮件不会发出。
 
     Args:
         subject: 邮件主题
         body: 正文（只写用户要求传达的内容，不要加 Agent 签名）
         to: 收件人，多个用逗号分隔；可空（QQ / OneBot 默认当前用户QQ号@qq.com）
         cc: 抄送，可空，多个用逗号分隔
-        confirmed: Agently 账号为 True 时带 --confirmed；SMTP 忽略此项
+        confirmed: 保留参数；执行时一律确认发送（用户审批已过）
     """
     target = resolve_send_to(to, ev.bot_id, ev.user_id)
     if not target:
@@ -69,7 +70,7 @@ async def send_email(
         subject=subject,
         body=body,
         cc=cc or None,
-        confirmed=confirmed,
+        confirmed=True,
         on_auth_url=on_auth_url,
     )
     label = result["account"] or result["backend"]

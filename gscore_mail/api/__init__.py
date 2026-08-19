@@ -190,8 +190,29 @@ async def _send_agently_once(
     )
     raw = run["stdout"] or run["stderr"]
     payload = agently_backend.parse_cli_payload(raw)
-    if run["exit_code"] == 0:
-        return _ok("agently", f"已通过 Agently Mail 发送（{label}）", label, raw), payload
+    token = agently_backend.extract_confirmation_token(payload)
+    if run["exit_code"] == 0 and token and not confirmation_token:
+        if confirmed:
+            return await _send_agently_once(
+                account,
+                to_list,
+                subject,
+                body,
+                cc_list,
+                bcc_list,
+                False,
+                token,
+            )
+        return (
+            _fail("agently", f"Agently 只返回了确认令牌 {token}，邮件尚未发出", label, raw),
+            payload,
+        )
+    if run["exit_code"] == 0 and not agently_backend.payload_rejected(payload):
+        msg_id = agently_backend.extract_message_id(payload)
+        sent = f"已通过 Agently Mail 发送（{label}）"
+        if msg_id:
+            sent = f"{sent} {msg_id}"
+        return _ok("agently", sent, label, raw), payload
     return _fail("agently", agently_backend.agently_error_message(payload, run["exit_code"]), label, raw), payload
 
 

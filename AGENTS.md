@@ -94,7 +94,7 @@ uv run pytest tests -q
 - 测试在 `tests/test_gscore_mail.py`。`monkeypatch` `load_settings`、`send_smtp`、`run_agently`。
 - 不要打真实 SMTP / 真实 CLI。
 - 改策略：覆盖 `select_accounts`（never 只留第一条启用；failover 去掉 disabled；random 长度为 1）以及 `send()` 的 failover / never。
-- 改 CLI 参数：`--confirmed` vs `--confirmation-token`。
+- 改 CLI 参数：`--confirmed` vs `--confirmation-token`。exit 0 + `ctk_` 必须 `ok=False` 或用 token 再发一次。
 - 改 Windows CLI 启动：覆盖 `resolve_cli` 优先 `.cmd`，`spawn_argv` 改写成 `node` + JS。
 - 改 `send()` 契约：`enable_send=false`、空收件人、空主题必须 `ok=False`。
 - Agently `error.type=auth`：`send()` 会走 OAuth 再发一次。`infer_qq_mail` 只对 onebot / qq 数字 ID。
@@ -118,7 +118,7 @@ uv run pytest tests -q
 2. **策略语义不要混。** `random` 抽中谁就只试谁；`failover` 才依次换；`never` 失败也不碰后面的 Agently。
 3. **Agently 是池成员，不是第二套全局后端。** 不要再加顶层 `backend=smtp|agently` 开关。
 4. **多套 Agently 靠 `agently_home`。** CLI 默认把 token 放系统钥匙串 / 用户目录，同一 HOME 会抢同一登录。隔离目录要在 `run_agently(..., home=)` 里写成 `HOME` / `USERPROFILE` / `XDG_CONFIG_HOME`。
-5. **`confirmed` 仍是全局库开关**（`agently_auto_confirm`），不是按账号配。AI `send_email(confirmed=False)` 默认不带 `--confirmed`。
+5. **`confirmed` 仍是全局库开关**（`agently_auto_confirm`），不是按账号配。AI `send_email` 执行时必须带 `--confirmed`（用户审批已过）。exit 0 且带 `ctk_` 只是确认令牌，**不算已发送**。
 6. **`html=True` 只对 SMTP 有效。** failover 到 Agently 时正文仍当纯文本 `--body`。
 7. **`GsRepeatGroupConfig` 读取**是 `item["name"].data`，且必须先 `isinstance`。`set_config` 传入的是裸值列表，不是 GSC。见技能 [§4.6](../../../.agents/skills/gscore-plugin-development/references/04-config-management.md#46-可重复配置组-gsrepeatgroupconfig)。
 8. **QQ SMTP 密码是授权码。** 池内 `smtp_password` 已 `secret=True`。
